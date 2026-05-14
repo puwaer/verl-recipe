@@ -19,7 +19,7 @@ from typing import NamedTuple
 import torch
 from codetiming import Timer
 from transformers import AutoConfig
-from vllm import LLM, SamplingParams
+from vllm import LLM, SamplingParams, TokensPrompt
 
 # from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.engine.logprobs import LogprobsProcessor
@@ -165,7 +165,8 @@ class VLLMEngine:
         else:
             sampling_params = make_sampling_params()
 
-        outputs = self.llm.generate(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params)
+        prompts_input = [TokensPrompt(prompt_token_ids=p) for p in prompt_token_ids]
+        outputs = self.llm.generate(prompts=prompts_input, sampling_params=sampling_params)
 
         responses, teacher_topk_logprobs, teacher_topk_indices = [], [], []
         for output in outputs:
