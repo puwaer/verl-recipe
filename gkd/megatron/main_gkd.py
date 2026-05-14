@@ -196,13 +196,17 @@ class TaskRunner:
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
         from verl.trainer.main_ppo import create_rl_sampler
-        from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
+        # New verl's RLHFDataset emits only raw_prompt; GKD's _async_gen_next_batch
+        # still pops input_ids/attention_mask/position_ids/raw_prompt_ids.
+        # LegacyRLHFDataset re-adds those tokenized keys (recipe/-side workaround).
+        from verl.utils.dataset.rl_dataset import collate_fn
+        from recipe.gkd.megatron._legacy_rl_dataset import LegacyRLHFDataset
 
         # Create training and validation datasets.
-        train_dataset = RLHFDataset(config.data.train_files, tokenizer, config.data, None)
+        train_dataset = LegacyRLHFDataset(config.data.train_files, tokenizer, config.data, None)
 
         if config.data.val_files:
-            val_dataset = RLHFDataset(config.data.val_files, tokenizer, config.data, None)
+            val_dataset = LegacyRLHFDataset(config.data.val_files, tokenizer, config.data, None)
         else:
             val_dataset = None
 
