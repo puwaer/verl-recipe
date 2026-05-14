@@ -14,6 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Apply transformers 5.3+ rope_theta -> rope_parameters compat shim BEFORE any
+# verl import that triggers model_initializer (which reads hf_config.rope_theta).
+# This module is imported by Ray actor processes (WorkerDict) when they
+# instantiate MegatronOnPolicyDistillActorWorker / RolloutWorker, ensuring the
+# monkey-patch runs in those actor processes too (driver process is handled by
+# main_gkd.py).
+from recipe.gkd.megatron import _compat  # noqa: F401
+
 import asyncio
 import logging
 import os
@@ -49,7 +57,7 @@ from verl.utils.profiler import (
     simple_timer,
 )
 from verl.utils.profiler.performance import gather_timing
-from verl.utils.profiler.profile import Profiler
+from verl.utils.profiler.torch_profile import Profiler
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import rearrange_micro_batches
 from verl.workers.megatron_workers import ActorRolloutRefWorker
@@ -167,7 +175,18 @@ class OnPolicyDistillActor:
         self.tf_config = tf_config
         self.actor_module = actor_module
         self.actor_optimizer: DistributedOptimizer = actor_optimizer
-        self.prof = Profiler(self.config.profiler)
+        # verl/utils/profiler/torch_profile.py:Profiler is now (rank, config, tool_config, ...).
+        # Old GKD recipe called Profiler(config) which fails as missing 'config'.
+        # Also pass an empty TorchProfilerToolConfig() to avoid verl Profiler's
+        # `self.tool_config.contents` bug (None.contents AttributeError) when
+        # tool_config defaults to None and profiler is disabled.
+        import torch.distributed as _dist
+        from verl.utils.profiler.config import TorchProfilerToolConfig
+        self.prof = Profiler(
+            _dist.get_rank() if _dist.is_initialized() else 0,
+            self.config.profiler,
+            tool_config=TorchProfilerToolConfig(),
+        )
         self.optimizer_step_args = OmegaConf.create(
             {
                 "skip_grad": None,

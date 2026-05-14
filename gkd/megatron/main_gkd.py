@@ -16,13 +16,17 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
 
+# Apply transformers 5.3+ rope_theta -> rope_parameters compat shim before any
+# verl import that uses `hf_config.rope_theta`.
+from recipe.gkd.megatron import _compat  # noqa: F401
+
 import os
 import socket
 
 import hydra
 import ray
 from omegaconf import OmegaConf
-from recipe.gkd.ray_trainer import OnPolicyDistillTrainer
+from recipe.gkd.megatron.ray_trainer import OnPolicyDistillTrainer
 
 RAY_RUNTIME_ENV = {
     "env_vars": {
@@ -148,7 +152,7 @@ class TaskRunner:
         if config.actor_rollout_ref.actor.strategy == "megatron":
             from verl.single_controller.ray import RayWorkerGroup
 
-            from .megatron_workers import (
+            from recipe.gkd.megatron.megatron_workers import (
                 MegatronOnPolicyDistillActorWorker,
                 MegatronOnPolicyDistillRolloutWorker,
             )

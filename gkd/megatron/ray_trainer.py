@@ -25,8 +25,8 @@ import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf, open_dict
-from recipe.gkd.teacher import TeacherClient
-from recipe.gkd.teacher_utils import get_teacher_knowledge
+from recipe.gkd.megatron.teacher import TeacherClient
+from recipe.gkd.megatron.teacher_utils import get_teacher_knowledge
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
@@ -319,6 +319,10 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
             actor_rollout_workers,
             len(actor_rollout_workers),
             list(range(0, len(actor_rollout_workers))),
+            # ray.util.collective NCCL backend requires cupy.cuda.nccl.
+            # verl_arm_nccl.sif (built via singularity/build_verl_arm_nccl.sh)
+            # has cupy-cuda12x installed, so this works. If using the original
+            # verl_arm.sif (no cupy), switch backend to "gloo".
             backend="nccl",
             group_name="actor_rollout",
         )
