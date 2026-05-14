@@ -38,6 +38,14 @@ INFER_TP=1
 WORKING_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/config/runtime_env.yaml"}
 # RAY_ADDRESS='auto' ray job submit --working-dir . --
+#
+# NOTE: 以下の Hydra override は verl 必須のものを config/on_policy_distill_trainer.yaml に集約済:
+#   - rollout.mode=async, rollout.n=1
+#   - rollout.prometheus._target_/.enable / rollout.mtp._target_ / rollout.agent._target_
+#   - model._target_=HFModelConfig
+#   - actor.megatron.{dist_checkpointing_prefix, dist_ckpt_optim_fully_reshardable, distrib_optim_fully_reshardable_mem_efficient, override_ddp_config, override_mcore_model_config, vanilla_mbridge}
+#   - actor.router_replay.mode=disabled
+# 以下では「環境/run 固有」(model path, data path, リソース数, batch, lr, save_freq 等) のみ override する
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
     -- python3 -m main_gkd --config-name on_policy_distill_trainer \
