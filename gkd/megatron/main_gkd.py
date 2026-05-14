@@ -168,8 +168,10 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
         # Map roles to their corresponding remote worker classes.
+        # β1: rollout WorkerGroup is removed (AgentLoopManager spawns its own
+        # vLLM HTTP servers in standalone mode). `rollout_cls` is kept above
+        # for future hybrid-mode migration but no longer instantiated.
         role_worker_mapping = {
-            Role.Rollout: ray.remote(rollout_cls),
             Role.Actor: ray.remote(actor_cls),
         }
 
@@ -177,18 +179,13 @@ class TaskRunner:
         # Map roles to the resource pool.
         assert config.trainer.n_gpus_per_node > 0, "config.trainer.n_gpus_per_node must be greater than 0"
         assert config.trainer.nnodes > 0, "config.trainer.nnodes must be greater than 0"
-        assert config.rollout.n_gpus_per_node > 0, "config.rollout.n_gpus_per_node must be greater than 0"
-        assert config.rollout.nnodes > 0, "config.rollout.nnodes must be greater than 0"
 
         actor_pool = [config.trainer.n_gpus_per_node] * config.trainer.nnodes
-        rollout_pool = [config.rollout.n_gpus_per_node] * config.rollout.nnodes
 
         resource_pool_spec = {
-            "rollout_pool": rollout_pool,
             "actor_pool": actor_pool,
         }
         mapping = {
-            Role.Rollout: "rollout_pool",
             Role.Actor: "actor_pool",
         }
         print(f"resource_pool_spec: {resource_pool_spec}")

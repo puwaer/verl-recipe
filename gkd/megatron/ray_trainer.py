@@ -255,14 +255,8 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         # Build Ray classes per pool
         resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
-        # Rollout group
-        rollout_pool = self.resource_pool_manager.get_resource_pool(Role.Rollout)
-        rollout_cls = RayClassWithInitArgs(
-            cls=self.role_worker_mapping[Role.Rollout],
-            config=self.config.actor_rollout_ref,
-            role="rollout",
-        )
-        resource_pool_to_cls[rollout_pool]["rollout"] = rollout_cls
+        # β1: Rollout WorkerGroup removed; AgentLoopManager (standalone mode)
+        # spawns its own vLLM HTTP servers on rollout.nnodes × n_gpus_per_node.
 
         # Actor group
         actor_pool = self.resource_pool_manager.get_resource_pool(Role.Actor)
@@ -303,34 +297,21 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
             all_wg.update(spawn_wg)
             time.sleep(20)  # avoid port conflict
 
-        self.rollout_wg = all_wg["rollout"]
         self.actor_wg = all_wg["actor"]
-
-        # Initialize both groups
-        self.rollout_wg.init_model()
         self.actor_wg.init_model()
-        self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
-        weights_info = self.actor_wg.get_actor_weights_info()[0]
-        self.rollout_wg.set_actor_weights_info(weights_info)
-        from ray.util.collective import collective
+        self.actor_rollout_wg = self.actor_wg  # alias for downstream compatibility
 
-        actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
-        collective.create_collective_group(
-            actor_rollout_workers,
-            len(actor_rollout_workers),
-            list(range(0, len(actor_rollout_workers))),
-            # ray.util.collective NCCL backend requires cupy.cuda.nccl.
-            # verl_arm_nccl.sif (built via singularity/build_verl_arm_nccl.sh)
-            # has cupy-cuda12x installed, so this works. If using the original
-            # verl_arm.sif (no cupy), switch backend to "gloo".
-            backend="nccl",
-            group_name="actor_rollout",
-        )
+        # β1: AgentLoopManager spawns its own vLLM HTTP servers in standalone
+        # mode (worker_group=None). nnodes / n_gpus_per_node come from
+        # actor_rollout_ref.rollout.* via Hydra override in helper script.
+        from verl.experimental.agent_loop import AgentLoopManager
+        self.async_rollout_manager = AgentLoopManager.create(config=self.config)
 
     def sync_rollout_weights(self):
-        assert not self.hybrid_engine
-        self.actor_wg.sync_rollout_weights()
-        ray.get(self.rollout_wg.sync_rollout_weights())
+        # β1 phase 1: real weight sync needs CheckpointEngineManager wiring
+        # (out of scope here). With stale vLLM rollout weights + a few-step
+        # self-distillation run, KL loss is still meaningful for pipeline check.
+        return
 
     def _create_continuous_iterator(self):
         """
@@ -366,7 +347,10 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         if sync_before_generation:
             self.sync_rollout_weights()
         # Call non-blocking rollout (worker method registered with blocking=False)
-        gen_batch_output = self.rollout_wg.async_generate_sequences(gen_batch)
+        # β1: AgentLoopManager.generate_sequences() returns DataProto synchronously.
+        # GenerationBatchFuture.get() at :90 handles non-future objects via
+        # `hasattr(.., "get")` guard, so no scheduler refactor is required.
+        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
         return GenerationBatchFuture(epoch, batch, gen_batch_output)
 
     def _async_get_teacher_knowledge(self, future: GenerationBatchFuture):
@@ -584,7 +568,6 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
                 else False
             )
             if do_profile:
-                self.rollout_wg.start_profile()
                 self.actor_wg.start_profile()
 
             metrics = {}
@@ -692,7 +675,6 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
             self.global_steps += 1
 
             if do_profile:
-                self.rollout_wg.stop_profile()
                 self.actor_wg.stop_profile()
 
             if is_last_step:
