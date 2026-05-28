@@ -38,6 +38,7 @@ actor_rollout_ref:
   hybrid_engine: False
   nccl_timeout: 600 # seconds, default is 10 minutes for torch, you can set it to a larger value if you have long-running operations like 32B or 72B model using megatron
   model:
+    _target_: verl.workers.config.HFModelConfig
     path: /path/to/MODEL
     custom_chat_template: null
     external_lib: null
@@ -74,10 +75,20 @@ actor_rollout_ref:
       use_distributed_optimizer: True
       use_dist_checkpointing: False
       dist_checkpointing_path: null
+      dist_checkpointing_prefix: ""
+      # 新 verl で追加された dist_ckpt 系フラグ。デフォルト False で既存挙動を維持
+      dist_ckpt_optim_fully_reshardable: False
+      distrib_optim_fully_reshardable_mem_efficient: False
+      override_ddp_config: {}
+      override_mcore_model_config: {}
       seed: 42
       # additional transformer config like: num_layers_in_first(/last)_pipeline_stage
       override_transformer_config: {}
       use_mbridge: False
+      vanilla_mbridge: True
+    # MoE router replay は GKD では使わない (mode=disabled で短絡)
+    router_replay:
+      mode: disabled
     optim:
       # Learning rate
       lr: 1e-6
@@ -181,7 +192,16 @@ actor_rollout_ref:
   rollout:
     _target_: verl.workers.config.RolloutConfig
     name: vllm
-    mode: sync # sync: LLM, async: AsyncLLM
+    mode: async # sync: LLM (廃止), async: AsyncLLM (新 verl 必須)
+    # Number of rollouts per prompt (1 for GKD: 1 prompt → 1 response)
+    n: 1
+    # PrometheusConfig: optional metrics export; disabled by default
+    prometheus:
+      _target_: verl.workers.config.PrometheusConfig
+      enable: False
+    # MtpConfig: Multi-Token Prediction speculative decoding; disabled by default
+    mtp:
+      _target_: verl.workers.config.MtpConfig
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 1
@@ -261,12 +281,14 @@ actor_rollout_ref:
 
     # [Experimental] agent loop based rollout configs
     agent:
+      _target_: verl.workers.config.AgentLoopConfig
       # Number of agent loop workers
       num_workers: 8
       custom_async_server:
         path: null
         name: null
-    update_weights_bucket_megabytes: 512
+    # NOTE: update_weights_bucket_megabytes は新 verl で
+    # rollout.checkpoint_engine.update_weights_bucket_megabytes に移動済
     # support logging rollout prob for debugging purpose
     calculate_log_probs: False
     # # Nsight system profiler configs

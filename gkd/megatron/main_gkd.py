@@ -16,13 +16,17 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
 
+# Apply transformers 5.3+ rope_theta -> rope_parameters compat shim before any
+# verl import that uses `hf_config.rope_theta`.
+from recipe.gkd.megatron import _compat  # noqa: F401
+
 import os
 import socket
 
 import hydra
 import ray
 from omegaconf import OmegaConf
-from recipe.gkd.ray_trainer import OnPolicyDistillTrainer
+from recipe.gkd.megatron.ray_trainer import OnPolicyDistillTrainer
 
 RAY_RUNTIME_ENV = {
     "env_vars": {
@@ -148,7 +152,7 @@ class TaskRunner:
         if config.actor_rollout_ref.actor.strategy == "megatron":
             from verl.single_controller.ray import RayWorkerGroup
 
-            from .megatron_workers import (
+            from recipe.gkd.megatron.megatron_workers import (
                 MegatronOnPolicyDistillActorWorker,
                 MegatronOnPolicyDistillRolloutWorker,
             )
@@ -164,8 +168,10 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
         # Map roles to their corresponding remote worker classes.
+        # β1: rollout WorkerGroup is removed (AgentLoopManager spawns its own
+        # vLLM HTTP servers in standalone mode). `rollout_cls` is kept above
+        # for future hybrid-mode migration but no longer instantiated.
         role_worker_mapping = {
-            Role.Rollout: ray.remote(rollout_cls),
             Role.Actor: ray.remote(actor_cls),
         }
 
@@ -173,18 +179,13 @@ class TaskRunner:
         # Map roles to the resource pool.
         assert config.trainer.n_gpus_per_node > 0, "config.trainer.n_gpus_per_node must be greater than 0"
         assert config.trainer.nnodes > 0, "config.trainer.nnodes must be greater than 0"
-        assert config.rollout.n_gpus_per_node > 0, "config.rollout.n_gpus_per_node must be greater than 0"
-        assert config.rollout.nnodes > 0, "config.rollout.nnodes must be greater than 0"
 
         actor_pool = [config.trainer.n_gpus_per_node] * config.trainer.nnodes
-        rollout_pool = [config.rollout.n_gpus_per_node] * config.rollout.nnodes
 
         resource_pool_spec = {
-            "rollout_pool": rollout_pool,
             "actor_pool": actor_pool,
         }
         mapping = {
-            Role.Rollout: "rollout_pool",
             Role.Actor: "actor_pool",
         }
         print(f"resource_pool_spec: {resource_pool_spec}")
@@ -192,13 +193,17 @@ class TaskRunner:
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
         from verl.trainer.main_ppo import create_rl_sampler
-        from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
+        # New verl's RLHFDataset emits only raw_prompt; GKD's _async_gen_next_batch
+        # still pops input_ids/attention_mask/position_ids/raw_prompt_ids.
+        # LegacyRLHFDataset re-adds those tokenized keys (recipe/-side workaround).
+        from verl.utils.dataset.rl_dataset import collate_fn
+        from recipe.gkd.megatron._legacy_rl_dataset import LegacyRLHFDataset
 
         # Create training and validation datasets.
-        train_dataset = RLHFDataset(config.data.train_files, tokenizer, config.data, None)
+        train_dataset = LegacyRLHFDataset(config.data.train_files, tokenizer, config.data, None)
 
         if config.data.val_files:
-            val_dataset = RLHFDataset(config.data.val_files, tokenizer, config.data, None)
+            val_dataset = LegacyRLHFDataset(config.data.val_files, tokenizer, config.data, None)
         else:
             val_dataset = None
 

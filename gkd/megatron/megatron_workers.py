@@ -14,6 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Apply transformers 5.3+ rope_theta -> rope_parameters compat shim BEFORE any
+# verl import that triggers model_initializer (which reads hf_config.rope_theta).
+# This module is imported by Ray actor processes (WorkerDict) when they
+# instantiate MegatronOnPolicyDistillActorWorker / RolloutWorker, ensuring the
+# monkey-patch runs in those actor processes too (driver process is handled by
+# main_gkd.py).
+from recipe.gkd.megatron import _compat  # noqa: F401
+
 import asyncio
 import logging
 import os
@@ -49,7 +57,7 @@ from verl.utils.profiler import (
     simple_timer,
 )
 from verl.utils.profiler.performance import gather_timing
-from verl.utils.profiler.profile import Profiler
+from verl.utils.profiler.torch_profile import Profiler
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import rearrange_micro_batches
 from verl.workers.megatron_workers import ActorRolloutRefWorker
@@ -167,7 +175,18 @@ class OnPolicyDistillActor:
         self.tf_config = tf_config
         self.actor_module = actor_module
         self.actor_optimizer: DistributedOptimizer = actor_optimizer
-        self.prof = Profiler(self.config.profiler)
+        # verl/utils/profiler/torch_profile.py:Profiler is now (rank, config, tool_config, ...).
+        # Old GKD recipe called Profiler(config) which fails as missing 'config'.
+        # Also pass an empty TorchProfilerToolConfig() to avoid verl Profiler's
+        # `self.tool_config.contents` bug (None.contents AttributeError) when
+        # tool_config defaults to None and profiler is disabled.
+        import torch.distributed as _dist
+        from verl.utils.profiler.config import TorchProfilerToolConfig
+        self.prof = Profiler(
+            _dist.get_rank() if _dist.is_initialized() else 0,
+            self.config.profiler,
+            tool_config=TorchProfilerToolConfig(),
+        )
         self.optimizer_step_args = OmegaConf.create(
             {
                 "skip_grad": None,
@@ -219,6 +238,9 @@ class OnPolicyDistillActor:
         #     group=mpu.get_pipeline_model_parallel_group(),
         # )
         # split into micro-batches
+        # tensordict 0.10+: Ray-roundtripped TensorDict comes back locked,
+        # so __setitem__ for dtype change (float → bool) is rejected. Unlock first.
+        data.batch.unlock_()
         data.batch["attention_mask"] = data.batch["attention_mask"].to(bool)
 
         indices = None
@@ -571,7 +593,18 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def sync_rollout_weights(self):
+        # TEMP NO-OP (Phase 1 of new-verl rollout API migration):
+        # The legacy collective-broadcast path is incompatible with new verl's
+        # ServerAdapter + IPC handle architecture. As a first pass to verify the
+        # rest of the GKD pipeline (rollout generation, teacher knowledge, KL
+        # loss, optimizer step), we skip weight sync entirely. At step 1 actor
+        # and rollout share the same dist_ckpt weights, so this is safe for the
+        # initial step; subsequent steps will use stale rollout weights until
+        # we wire up the proper `await self.rollout.update_weights(per_tensor_gen)`
+        # path (requires actor+rollout colocation refactor).
         assert self._is_actor and not self.config.hybrid_engine
+        return
+        # ----- legacy code below kept for reference, unreachable -----
         assert hasattr(self, "_weights_info") and self._weights_info is not None
 
         params_generator = self._get_actor_params_generator()
@@ -739,7 +772,48 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
         # No context switching here; rollout-only worker always in rollout mode.
 
         with simple_timer("generate_sequences", timing_generate):
-            output = self.rollout.generate_sequences(prompts=prompts)
+            # TEMP STUB (Phase 2 of new-verl rollout API migration):
+            # New verl's `ServerAdapter.generate_sequences()` raises
+            # NotImplementedError (vLLM SPMD mode retired in PR #4411; only the
+            # async server interface remains). Pipeline-verification stub:
+            # fill `responses` with pad tokens so the rest of the pipeline
+            # (teacher knowledge fetch → KL loss → optimizer step) can execute
+            # to completion. The resulting loss is meaningless.
+            from tensordict import TensorDict
+
+            input_ids = prompts.batch["input_ids"]
+            attention_mask = prompts.batch["attention_mask"]
+            position_ids = prompts.batch["position_ids"]
+            bsz, prompt_length = input_ids.shape
+            response_length = int(self.config.rollout.response_length)
+            pad_token_id = prompts.meta_info["pad_token_id"]
+            device = input_ids.device
+
+            responses = torch.full(
+                (bsz, response_length), pad_token_id, dtype=input_ids.dtype, device=device,
+            )
+            full_input_ids = torch.cat([input_ids, responses], dim=-1)
+            response_attention_mask = torch.zeros(
+                (bsz, response_length), dtype=attention_mask.dtype, device=device,
+            )
+            full_attention_mask = torch.cat([attention_mask, response_attention_mask], dim=-1)
+
+            delta_position_id = torch.arange(1, response_length + 1, device=device)
+            delta_position_id = delta_position_id.unsqueeze(0).expand(bsz, -1)
+            response_position_ids = position_ids[:, -1:] + delta_position_id
+            full_position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+
+            stub_batch = TensorDict(
+                {
+                    "prompts": input_ids,
+                    "responses": responses,
+                    "input_ids": full_input_ids,
+                    "attention_mask": full_attention_mask,
+                    "position_ids": full_position_ids,
+                },
+                batch_size=bsz,
+            )
+            output = DataProto(batch=stub_batch, meta_info=dict(prompts.meta_info))
 
         # We calculate the average timing across all ranks
         # to make sure meta_info["timing"] is the same
@@ -757,9 +831,17 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def sync_rollout_weights(self):
+        # TEMP NO-OP (Phase 1 of new-verl rollout API migration): see the
+        # corresponding comment in MegatronOnPolicyDistillActorWorker.sync_rollout_weights.
+        # New verl's vLLM rollout is now an out-of-process `ServerAdapter`
+        # without direct `inference_engine` access; the legacy in-process
+        # broadcast path is no longer reachable. Skipping for now lets us
+        # verify the rest of the pipeline.
+        assert self._is_rollout and not self.config.hybrid_engine
+        return
+        # ----- legacy code below kept for reference, unreachable -----
         from ray.util.collective import collective
 
-        assert self._is_rollout and not self.config.hybrid_engine
         assert hasattr(self, "_weights_info") and self._weights_info is not None
         rollout_name = self.config.rollout.name
         if rollout_name == "vllm":
